@@ -13,6 +13,8 @@ using System.Linq;
 using Pipl.APIs.Utils;
 using System.Threading.Tasks;
 using System.Globalization;
+using System.Net.Http;
+using System.Net.Http.Headers;
 
 namespace Pipl.APIs.Search
 {
@@ -36,19 +38,24 @@ namespace Pipl.APIs.Search
         private static string BaseUrlHttpS = "https://api.pipl.com/search/?";
 
         private static string ClientUserAgent;
+        private static string ClientUserAgentVersion;
+
+        private static HttpClient httpClient;
 
         // static CTOR
         static SearchAPIRequest()
         {
             DefaultConfiguration = new SearchConfiguration();
             Version version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
-            ClientUserAgent = string.Format("piplapis/csharp/{0}.{1}.{2}", version.Major, version.Minor, version.Build);
+            //ClientUserAgent = string.Format("piplapis/csharp/{0}.{1}.{2}", version.Major, version.Minor, version.Build);
+            ClientUserAgent = "piplapis-csharp";
+            ClientUserAgentVersion = $"{version.Major}.{version.Minor}.{version.Build}";
 
+            httpClient = new HttpClient();
         }
 
         #endregion
 
-        
         public Person Person { get; set; }
 
         public SearchConfiguration Configuration;
@@ -114,9 +121,13 @@ namespace Pipl.APIs.Search
             {
                 res.Add("source_category_requirements", EffectiveConfiguration.SourceCategoryRequirements);
             }
-                
 
             return res;
+        }
+
+        private IEnumerable<KeyValuePair<string, string>> ConvertToKeyValuePairs(NameValueCollection collection)
+        {
+            return collection.AllKeys.SelectMany(collection.GetValues, (k, v) => new KeyValuePair<string, string>(k, v));
         }
 
         /**
@@ -264,62 +275,36 @@ namespace Pipl.APIs.Search
          *
          * @param strictValidation      A bool argument that's passed to the
          *                              validateQueryParams method.
-         * @return SearchAPIResponse object containing the response
+         * @return A task that runs the request asyncronously
          * @throws ArgumentException    Raises ArgumentException (raised from validateQueryParams)
-         * @throws WebException         WebException
-         * @throws SearchAPIError       SearchAPIError with api specific error. 
+         * @throws IOException          IOException
          */
-        public SearchAPIResponse Send(bool strictValidation = true)
+        public async Task<SearchAPIResponse> SendAsync(bool strictValidation = true)
         {
             ValidateQueryParams(strictValidation);
-            TaskCompletionSource<SearchAPIResponse> taskCompletionSource = new TaskCompletionSource<SearchAPIResponse>();
+            SearchAPIResponse response;
 
-            using (WebClient client = new WebClient())
+            using (var httpReq = new HttpRequestMessage(HttpMethod.Post, Url))
             {
-                client.Headers.Add("User-Agent", ClientUserAgent);
-                Uri uri = new Uri(Url);
-                try
-                {
-                    byte[] response = client.UploadValues(Url, _getUrlParams());
-                    string jsonResp = System.Text.Encoding.UTF8.GetString(response);
-                    var res = JsonConvert.DeserializeObject<SearchAPIResponse>(System.Text.Encoding.UTF8.GetString(response));
-                    res.RawJSON = jsonResp;
-                    _update_response_headers(webClient: client, response: res);
-                    return res;
-                }
-                catch (WebException e)
-                {
-                    if (e.Response == null)
-                    {
-                        throw e;
-                    }
-                    string result;
-                    using (StreamReader sr = new StreamReader(e.Response.GetResponseStream()))
-                    {
-                        result = sr.ReadToEnd();
-                    }
-                    Dictionary<string, object> err = null;
-                    err = JsonConvert.DeserializeObject<Dictionary<string, object>>(result);
+                httpReq.Headers.UserAgent.Add(new ProductInfoHeaderValue(ClientUserAgent, ClientUserAgentVersion));
+                httpReq.Content = new FormUrlEncodedContent(ConvertToKeyValuePairs(_getUrlParams()));
 
-                    if (!err.ContainsKey("error"))
+                using (var httpResp = await httpClient.SendAsync(httpReq))
+                {
+                    if (!httpResp.IsSuccessStatusCode)
                     {
-                        throw e;
+                        throw await GetSearchApiError(httpResp);
                     }
-                    string error = err["error"].ToString();
-                    if (!err.ContainsKey("@http_status_code"))
-                    {
-                        throw e;
-                    }
-                    int httpStatusCode;
-                    if (!int.TryParse(err["@http_status_code"].ToString(), out httpStatusCode))
-                    {
-                        throw e;
-                    }
-                    SearchAPIError exc = new SearchAPIError(error, httpStatusCode);
-                    _update_response_headers(webResponse: e.Response, errResponse: exc);
-                    throw exc;
+
+                    var jsonRespString = await httpResp.Content.ReadAsStringAsync();
+
+                    response = JsonConvert.DeserializeObject<SearchAPIResponse>(jsonRespString);
+                    response.RawJSON = jsonRespString;
+                    _update_response_headers(httpResp, response: response);
                 }
             }
+
+            return response;
         }
 
         /**
@@ -332,7 +317,7 @@ namespace Pipl.APIs.Search
          * @throws ArgumentException    Raises ArgumentException (raised from validateQueryParams)
          * @throws IOException          IOException
          */
-        public Task<SearchAPIResponse> SendAsync(bool strictValidation = true)
+        public Task<SearchAPIResponse> SendOldAsync(bool strictValidation = true)
         {
             ValidateQueryParams(strictValidation);
             TaskCompletionSource<SearchAPIResponse> taskCompletionSource = new TaskCompletionSource<SearchAPIResponse>();
@@ -351,11 +336,38 @@ namespace Pipl.APIs.Search
             return taskCompletionSource.Task;
         }
 
+        private async Task<SearchAPIError> GetSearchApiError(HttpResponseMessage response)
+        {
+            var result = await response.Content.ReadAsStringAsync();
+            var err = JsonConvert.DeserializeObject<Dictionary<string, object>>(result);
+
+            if (!err.ContainsKey("error"))
+            {
+                return new SearchAPIError(result, (int)response.StatusCode);
+            }
+
+            var error = err["error"].ToString();
+            if (!err.ContainsKey("@http_status_code"))
+            {
+                return new SearchAPIError(result, (int)response.StatusCode);
+            }
+
+            if (!int.TryParse(err["@http_status_code"].ToString(), out var httpStatusCode))
+            {
+                return new SearchAPIError(result, (int)response.StatusCode);
+            }
+
+            var exc = new SearchAPIError(error, httpStatusCode);
+            _update_response_headers(responseMessage: response, errResponse: exc);
+
+            return exc;
+        }
+
         private void _searchUploadValuesCompletedEventHandler(WebClient client, UploadValuesCompletedEventArgs e, TaskCompletionSource<SearchAPIResponse> taskCompletionSource)
         {
             if (e.Error == null)
             {
-                string jsonResp = System.Text.Encoding.UTF8.GetString(e.Result);
+                string jsonResp = Encoding.UTF8.GetString(e.Result);
                 var res = JsonConvert.DeserializeObject<SearchAPIResponse>(jsonResp);
                 res.RawJSON = jsonResp;
                 _update_response_headers(webClient: client, response: res);
@@ -367,7 +379,7 @@ namespace Pipl.APIs.Search
                 taskCompletionSource.SetException(e.Error);
                 return;
             }
-            
+
             WebException we = (WebException)e.Error;
             HttpWebResponse response = (HttpWebResponse)we.Response;
             if (response == null)
@@ -390,7 +402,7 @@ namespace Pipl.APIs.Search
             }
 
             Dictionary<string, object> err = null;
-                
+
             try
             {
                 err = JsonConvert.DeserializeObject<Dictionary<string, object>>(result);
@@ -424,16 +436,238 @@ namespace Pipl.APIs.Search
             return;
         }
 
-        private void _update_response_headers(WebClient webClient= null, WebResponse webResponse = null, SearchAPIResponse response = null, SearchAPIError errResponse = null)
+        private string GetSingleHeaderValue(HttpHeaders headers, string key)
+        {
+            return !headers.TryGetValues(key, out var values) ? null : values.FirstOrDefault();
+        }
+
+        private void _update_response_headers(HttpResponseMessage responseMessage = null, SearchAPIResponse response = null, SearchAPIError errResponse = null)
         {
             
+            HttpHeaders headers = null;
+
+            if (responseMessage != null)
+            {
+                headers = responseMessage.Headers;
+            }
+
+            if (headers == null)
+            {
+                return;
+            }
+
+
+            var value = GetSingleHeaderValue(headers, "X-QPS-Allotted");
+            int intVal;
+            if (value != null) 
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QpsAllotted = intVal;
+                    }
+                    if (errResponse != null) {
+                        errResponse.QpsAllotted = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-QPS-Current");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QpsCurrent = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QpsCurrent = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-APIKey-Quota-Allotted");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QuotaAllotted = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QuotaAllotted = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-APIKey-Quota-Current");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QuotaCurrent = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QuotaCurrent = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-QPS-Live-Allotted");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QpsLiveAllotted = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QpsLiveAllotted = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-QPS-Live-Current");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QpsLiveCurrent = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QpsLiveCurrent = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-QPS-Demo-Allotted");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QpsDemoAllotted = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QpsDemoAllotted = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-QPS-Demo-Current");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.QpsDemoCurrent = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QpsDemoCurrent = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-Quota-Reset");
+            if (value != null)
+            {
+                try
+                {
+                    value = value.Replace(" UTC", " +0");
+                    DateTime quotaReset = DateTime.ParseExact(value, "dddd, MMMM dd, yyyy hh:mm:ss tt z", CultureInfo.InvariantCulture);
+                    if (response != null)
+                    {
+                        response.QuotaReset = quotaReset;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.QuotaReset = quotaReset;
+                    }
+                }
+                catch {}
+            }
+
+            value = GetSingleHeaderValue(headers, "X-Demo-Usage-Allotted");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.DemoUsageAlloted = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.DemoUsageAlloted = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-Demo-Usage-Current");
+            if (value != null)
+            {
+                if (Int32.TryParse(value, out intVal))
+                {
+                    if (response != null)
+                    {
+                        response.DemoUsageCurrent = intVal;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.DemoUsageCurrent = intVal;
+                    }
+                }
+            }
+
+            value = GetSingleHeaderValue(headers, "X-Demo-Usage-Expiry");
+            if (value != null)
+            {
+                try
+                {
+                    value = value.Replace(" UTC", " +0");
+                    DateTime quotaReset = DateTime.ParseExact(value, "dddd, MMMM dd, yyyy hh:mm:ss tt z", CultureInfo.InvariantCulture);
+                    if (response != null)
+                    {
+                        response.DemoUsageExpiry = quotaReset;
+                    }
+                    if (errResponse != null)
+                    {
+                        errResponse.DemoUsageExpiry = quotaReset;
+                    }
+                }
+                catch { }
+            }
+
+        }
+
+        private void _update_response_headers(WebClient webClient = null, WebResponse webResponse = null, SearchAPIResponse response = null, SearchAPIError errResponse = null)
+        {
+
             WebHeaderCollection headers = null;
 
             if (webClient != null)
             {
                 headers = webClient.ResponseHeaders;
-            } 
-            else if (webResponse != null) {
+            }
+            else if (webResponse != null)
+            {
                 headers = webResponse.Headers;
             }
 
@@ -445,7 +679,7 @@ namespace Pipl.APIs.Search
 
             string value = headers.Get("X-QPS-Allotted");
             int intVal;
-            if (value != null) 
+            if (value != null)
             {
                 if (Int32.TryParse(value, out intVal))
                 {
@@ -453,7 +687,8 @@ namespace Pipl.APIs.Search
                     {
                         response.QpsAllotted = intVal;
                     }
-                    if (errResponse != null) {
+                    if (errResponse != null)
+                    {
                         errResponse.QpsAllotted = intVal;
                     }
                 }
@@ -587,7 +822,7 @@ namespace Pipl.APIs.Search
                         errResponse.QuotaReset = quotaReset;
                     }
                 }
-                catch {}
+                catch { }
             }
 
             value = headers.Get("X-Demo-Usage-Allotted");
